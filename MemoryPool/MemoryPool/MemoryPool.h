@@ -7,6 +7,189 @@
 #define VALIDCODE (DWORD)(0x77777777)
 
 #define dfERR_NOTFREE 2080
+template <class T>
+class CLinkedList
+{
+public:
+	struct Node
+	{
+		T _Data;
+		Node *prev;
+		Node *next;
+	};
+
+	class iterator
+	{
+	private:
+		Node * pos;
+
+	public:
+		iterator(Node *_node = nullptr)
+		{
+			pos = _node;
+		}
+
+		iterator& operator++(int)
+		{
+			pos = pos->next;
+			return *this;
+		}
+
+		iterator& operator--()
+		{
+			pos = pos->prev;
+			return *this;
+		}
+
+		bool operator!=(iterator& iter)
+		{
+			if (this->pos != iter.pos)
+				return true;
+			return false;
+		}
+
+		bool operator==(iterator& iter)
+		{
+			if (this->pos == iter.pos)
+				return true;
+			return false;
+		}
+
+		T& operator*()
+		{
+			if (pos != nullptr)
+			{
+				return pos->_Data;
+			}
+		}
+	};
+
+	CLinkedList()
+	{
+		_size = 0;
+
+		head.next = nullptr;
+		head.next = &tail;
+		tail.next = nullptr;
+		tail.prev = &head;
+	}
+
+public:
+	iterator begin()
+	{
+		iterator iter(head.next);
+		return iter;
+	}
+
+	iterator end()
+	{
+		iterator iter(&tail);
+		return iter;
+	}
+
+	/*
+	- 이터레이터의 그 노드를 지움.
+	- 그리고 지운 노드의 다음 노드를 카리키는 이터레이터 리턴
+	아직 이 함수는 디버그를 하지 못함.
+	*/
+	iterator& erase(iterator &iter)
+	{
+		Delete(*iter);
+		iter++;
+		return iter;
+	}
+
+
+	void push_back(T Data)
+	{
+		Node *newNode = new Node;
+		newNode->_Data = Data;
+
+		newNode->prev = tail.prev;
+		newNode->next = &tail;
+
+		newNode->prev->next = newNode;
+		tail.prev = newNode;
+
+		_size++;
+	}
+
+	void push_front(T Data)
+	{
+		Node *newNode = (Node *)malloc(sizeof(Node));
+		newNode->_Data = Data;
+
+		newNode->prev = &head;
+		newNode->next = head.next;
+
+		newNode->next->prev = newNode;
+		Head.prev = newNode;
+
+		_size++;
+	}
+
+	T pop_back()
+	{
+		T ret = tail.prev->_Data;
+		Delete(tail.prev);
+		return ret;
+	}
+	T pop_front()
+	{
+		T ret = head.next->_Data;
+		Delete(head->next);
+		return ret;
+	}
+
+	int size()
+	{
+		return _size;
+	}
+	void clear()
+	{
+		Node *pStart = head.next;
+
+		while (pStart != &tail)
+		{
+			Node *delNode = pStart;
+
+			pStart->prev->next = pStart->next;
+			pStart->next->prev = pStart->prev;
+
+			_size--;
+
+			pStart = pStart->next;
+			delete delNode;
+		}
+	}
+
+private:
+	int _size;
+	Node head;
+	Node tail;
+
+	void Delete(T Data)
+	{
+		Node *pStart = head.next;
+
+		while (pStart->next != nullptr) // pStart != &Tail
+		{
+			if (pStart->_Data == Data)
+			{
+				Node *delNode = pStart;
+
+				pStart->prev->next = pStart->next;
+				pStart->next->prev = pStart->prev;
+				_size--;
+				delete delNode;
+				return;
+			}
+			else
+				pStart = pStart->next;
+
+		}
+	}
+};
 
 template <class DATA>
 class CMemoryPool
@@ -16,7 +199,7 @@ private:
 	{
 		DWORD ValidCode;
 		DATA Data;
-		
+
 		st_BLOCK_NODE *pNextBlock;
 	};
 public:
@@ -25,7 +208,7 @@ public:
 	// int - 블럭 갯수
 	// bool - 블록 생성자 호출여부(기본값 = FALSE)
 	//////////////////////////////////
-	CMemoryPool(int blockSize, bool bConst = false);
+	CMemoryPool(int blockSize = 1, bool bConst = false);
 	virtual ~CMemoryPool();
 
 
@@ -42,10 +225,10 @@ public:
 	//////////////////////////////////
 	bool Free(DATA *pData); // 그렇다면 외부에서 이 함수를 통해 반환하고, 나중에 이 주소값을 사용하려고 한다면? -> 주의
 
-	
-	//////////////////////////////////
-	// 총 확보된 블록의 갯수 리턴
-	//////////////////////////////////
+
+							//////////////////////////////////
+							// 총 확보된 블록의 갯수 리턴
+							//////////////////////////////////
 	int GetBlockCount(void);
 
 
@@ -59,14 +242,19 @@ public:
 
 
 private:
+	// 생성시 할당량
 	int m_iBlockSize;
 	bool m_bUseConstruct;
 
 	int m_iAllocCount;
 
+
+
 	st_BLOCK_NODE *pTop;
 	st_BLOCK_NODE *pTopOneBefore;
-	st_BLOCK_NODE *pDataArray;
+	st_BLOCK_NODE *pTail;
+
+	CLinkedList<st_BLOCK_NODE *> List;
 
 	CRITICAL_SECTION m_CrticalSection;
 
@@ -85,16 +273,29 @@ CMemoryPool<DATA>::CMemoryPool(int blockSize, bool bConst)
 	m_iAllocCount = 0;
 	pTop = nullptr;
 
-	pDataArray = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE) * blockSize);
-	
-	for (int i = 0; i < blockSize - 1; i++)
+	st_BLOCK_NODE *pNewNode = nullptr;
+	st_BLOCK_NODE *pOldNode = nullptr;
+
+	pNewNode = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE));
+	memset(pNewNode, 0, sizeof(st_BLOCK_NODE));
+	pNewNode->ValidCode = VALIDCODE;
+	List.push_back(pNewNode);
+
+	pOldNode = pNewNode;
+
+	for (int i = 1; i < blockSize; i++)
 	{
-		pDataArray[i].pNextBlock = &pDataArray[i + 1];
-		pDataArray[i].ValidCode = VALIDCODE;
+		pNewNode = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE));
+		memset(pNewNode, 0, sizeof(st_BLOCK_NODE));
+
+		pOldNode->pNextBlock = pNewNode;
+		pNewNode->ValidCode = VALIDCODE;
+		List.push_back(pNewNode);
+
+		pOldNode = pNewNode;
 	}
-	pDataArray[blockSize - 1].ValidCode = VALIDCODE;
-	pDataArray[blockSize - 1].pNextBlock = nullptr;
-		
+
+	pTail = pNewNode;
 }
 
 template <class DATA>
@@ -103,34 +304,55 @@ CMemoryPool<DATA>::~CMemoryPool()
 	DeleteCriticalSection(&m_CrticalSection);
 
 	if (m_bUseConstruct)
-		for (int i = 0; i < m_iBlockSize; i++)
-			pDataArray[i].Data.~DATA();
+	{
+		auto iter = List.begin();
 
-	free(pDataArray);
+		for (; iter != List.end();)
+		{
+			st_BLOCK_NODE *pNode = (*iter);
+			pNode->Data.~DATA();
+			List.erase(iter);
+			free(pNode);
+		}
+	}
 }
 
 template <class DATA>
 DATA* CMemoryPool<DATA>::Alloc(void)
 {
-	if (m_iAllocCount >= m_iBlockSize)
-		return nullptr;
-
 	EnterCriticalSection(&m_CrticalSection);
-
-	DATA* ret;
 	if (pTop == nullptr)
-		pTop = &pDataArray[0];  //// 0번 인덱스를 참조하게 한다
+		pTop = *List.begin();
 
-	if (m_bUseConstruct)
-		// New Placement 실행
+
+	if (m_iAllocCount >= m_iBlockSize - 500)
+	{
+		while (pTail->pNextBlock != nullptr)
+			pTail = pTail->pNextBlock;
+
+		for (int i = 0; i < 1000; i++)
+		{
+			st_BLOCK_NODE *pNewNode = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE));
+			memset(pNewNode, 0, sizeof(pNewNode));
+			pNewNode->ValidCode = VALIDCODE;
+			pNewNode->pNextBlock = nullptr;
+			pTail->pNextBlock = pNewNode;
+			List.push_back(pNewNode);
+
+			pTail = pNewNode;
+
+			m_iBlockSize++;
+		}
+
+	}
+
+	if (m_bUseConstruct) // New Placement 실행
 		new (&pTop->Data) DATA();
 
-	ret = &pTop->Data;
-	if (m_iAllocCount != m_iBlockSize - 1)
-	{
-		pTopOneBefore = pTop;
-		pTop = pTop->pNextBlock;
-	}
+	DATA* ret = &pTop->Data;
+
+	pTopOneBefore = pTop;
+	pTop = pTop->pNextBlock;
 
 	m_iAllocCount++;
 
@@ -151,23 +373,18 @@ bool CMemoryPool<DATA>::Free(DATA *pData)
 	if (pDel->ValidCode != VALIDCODE)
 		return false;
 
-	if (pTop == nullptr)
-		return false;
-	
+	if (pTop == nullptr || pTop == pDel)
+		pTop = pTopOneBefore;
+
 	EnterCriticalSection(&m_CrticalSection);
 
 	if (m_iAllocCount > 1)
 	{
-		if (pTop == pDel)
-		{
-			pTop = pTopOneBefore;
-		}
-
-		st_BLOCK_NODE *T = pTop->pNextBlock;
-		pTop->pNextBlock = pDel;
-		pDel->pNextBlock = T;
-		pTop = pDel;
+		pTopOneBefore->pNextBlock = pDel;
+		pDel->pNextBlock = pTop;
 	}
+
+	pTop = pDel;
 
 	if (m_bUseConstruct)
 		pDel->Data.~DATA();
