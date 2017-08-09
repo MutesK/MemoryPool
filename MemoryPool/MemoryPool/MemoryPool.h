@@ -128,6 +128,11 @@ public:
 		_size++;
 	}
 
+	T& GetLastData()
+	{
+		return tail.prev->_Data;
+	}
+
 	T pop_back()
 	{
 		T ret = tail.prev->_Data;
@@ -195,20 +200,23 @@ template <class DATA>
 class CMemoryPool
 {
 private:
+#pragma pack(push, 1)
 	struct st_BLOCK_NODE
 	{
 		DWORD ValidCode;
 		DATA Data;
+		bool bAlloc;
 
 		st_BLOCK_NODE *pNextBlock;
 	};
+#pragma pack(pop)
 public:
 	//////////////////////////////////
 	// 생성자
 	// int - 블럭 갯수
 	// bool - 블록 생성자 호출여부(기본값 = FALSE)
 	//////////////////////////////////
-	CMemoryPool(int blockSize = 1, bool bConst = false);
+	CMemoryPool(int blockSize = 10000, bool bConst = false);
 	virtual ~CMemoryPool();
 
 
@@ -226,9 +234,9 @@ public:
 	bool Free(DATA *pData); // 그렇다면 외부에서 이 함수를 통해 반환하고, 나중에 이 주소값을 사용하려고 한다면? -> 주의
 
 
-							//////////////////////////////////
-							// 총 확보된 블록의 갯수 리턴
-							//////////////////////////////////
+	//////////////////////////////////
+	// 총 확보된 블록의 갯수 리턴
+	//////////////////////////////////
 	int GetBlockCount(void);
 
 
@@ -251,7 +259,6 @@ private:
 
 
 	st_BLOCK_NODE *pTop;
-	st_BLOCK_NODE *pTopOneBefore;
 	st_BLOCK_NODE *pTail;
 
 	CLinkedList<st_BLOCK_NODE *> List;
@@ -280,16 +287,16 @@ CMemoryPool<DATA>::CMemoryPool(int blockSize, bool bConst)
 	memset(pNewNode, 0, sizeof(st_BLOCK_NODE));
 	pNewNode->ValidCode = VALIDCODE;
 	List.push_back(pNewNode);
-
 	pOldNode = pNewNode;
 
 	for (int i = 1; i < blockSize; i++)
 	{
 		pNewNode = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE));
-		memset(pNewNode, 0, sizeof(st_BLOCK_NODE));
-
+		pNewNode->bAlloc = false;
 		pOldNode->pNextBlock = pNewNode;
+		pNewNode->pNextBlock = nullptr;
 		pNewNode->ValidCode = VALIDCODE;
+
 		List.push_back(pNewNode);
 
 		pOldNode = pNewNode;
@@ -303,55 +310,52 @@ CMemoryPool<DATA>::~CMemoryPool()
 {
 	DeleteCriticalSection(&m_CrticalSection);
 
-	if (m_bUseConstruct)
-	{
-		auto iter = List.begin();
+	auto iter = List.begin();
 
-		for (; iter != List.end();)
-		{
-			st_BLOCK_NODE *pNode = (*iter);
-			pNode->Data.~DATA();
-			List.erase(iter);
-			free(pNode);
-		}
+	for (; iter != List.end();)
+	{
+		st_BLOCK_NODE *pNode = (*iter);
+		List.erase(iter);
+		free(pNode);
 	}
+
 }
 
 template <class DATA>
 DATA* CMemoryPool<DATA>::Alloc(void)
 {
 	EnterCriticalSection(&m_CrticalSection);
+
 	if (pTop == nullptr)
-		pTop = *List.begin();
+		pTop = *List.begin();  // 단 애는 딱 처음 Alloc했을때에만 작동하게끔 한다.
 
 
-	if (m_iAllocCount >= m_iBlockSize - 500)
+	/////////////////////////////////////////////////////////////////////
+	// 노드생성
+	// AllocCount와 블록카운트 값 비교
+	/////////////////////////////////////////////////////////////////////
+	if (m_iAllocCount >= m_iBlockSize - 5)
 	{
-		while (pTail->pNextBlock != nullptr)
-			pTail = pTail->pNextBlock;
-
-		for (int i = 0; i < 1000; i++)
+		// 노드를 새로 생성한다.
+		// 생성할 위치는?  pTail;
+		for (int i = 0; i < 5; i++)
 		{
 			st_BLOCK_NODE *pNewNode = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE));
-			memset(pNewNode, 0, sizeof(pNewNode));
 			pNewNode->ValidCode = VALIDCODE;
 			pNewNode->pNextBlock = nullptr;
-			pTail->pNextBlock = pNewNode;
-			List.push_back(pNewNode);
 
+			pTail->pNextBlock = pNewNode;
 			pTail = pNewNode;
 
 			m_iBlockSize++;
 		}
-
 	}
 
-	if (m_bUseConstruct) // New Placement 실행
-		new (&pTop->Data) DATA();
+	// pTop의 데이터포인터를 리턴할수 있게 한다.
+	DATA *ret = &pTop->Data;
 
-	DATA* ret = &pTop->Data;
-
-	pTopOneBefore = pTop;
+	pTop->bAlloc = true;
+	// pTop을 다음으로 넘긴다.
 	pTop = pTop->pNextBlock;
 
 	m_iAllocCount++;
@@ -368,29 +372,33 @@ DATA* CMemoryPool<DATA>::Alloc(void)
 template <class DATA>
 bool CMemoryPool<DATA>::Free(DATA *pData)
 {
-	st_BLOCK_NODE *pDel = (st_BLOCK_NODE *)((DWORD *)pData - 1); // DWORD는 4바이트이므로 데이터 보다 4바이트 위로 올리면 구조체를 가르킬수가 있다.
+	st_BLOCK_NODE *pDel = (st_BLOCK_NODE *)((DWORD *)pData - 1);
+
+	if (m_iAllocCount == 0)
+		return true;
 
 	if (pDel->ValidCode != VALIDCODE)
 		return false;
 
-	if (pTop == nullptr || pTop == pDel)
-		pTop = pTopOneBefore;
 
 	EnterCriticalSection(&m_CrticalSection);
 
-	if (m_iAllocCount > 1)
+	if (pTop == pDel->pNextBlock || pTop == pDel)
+		pTop = pDel;
+
+	else
 	{
-		pTopOneBefore->pNextBlock = pDel;
-		pDel->pNextBlock = pTop;
+		st_BLOCK_NODE *T = pTop->pNextBlock;
+
+
+		pDel->pNextBlock = T;
+		pTop->pNextBlock = pDel;
 	}
 
-	pTop = pDel;
+	pDel->bAlloc = false;
 
-	if (m_bUseConstruct)
-		pDel->Data.~DATA();
 
 	m_iAllocCount--;
-
 	LeaveCriticalSection(&m_CrticalSection);
 
 
