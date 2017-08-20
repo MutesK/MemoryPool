@@ -2,11 +2,15 @@
 
 #include <Windows.h>
 #include <new>
+/*
+Object Pool (FreeList형식) 의 Memory Pool
 
+움직이는 알고리즘 자체는 Stack과 비슷함.
+Lock-Free 도입
+*/
 
 #define VALIDCODE (DWORD)(0x77777777)
 
-#define dfERR_NOTFREE 2080
 template <class T>
 class CLinkedList
 {
@@ -205,10 +209,16 @@ private:
 	{
 		DWORD ValidCode;
 		DATA Data;
-		bool bAlloc;
 
 		st_BLOCK_NODE *pNextBlock;
 	};
+
+	struct st_Top
+	{
+		st_BLOCK_NODE *_TopNode;
+		__int64		   UniqueCount;
+	};
+
 #pragma pack(pop)
 public:
 	//////////////////////////////////
@@ -216,7 +226,7 @@ public:
 	// int - 블럭 갯수
 	// bool - 블록 생성자 호출여부(기본값 = FALSE)
 	//////////////////////////////////
-	CMemoryPool(int blockSize = 10000, bool bConst = false);
+	CMemoryPool(int blockSize = 0, bool bConst = false);
 	virtual ~CMemoryPool();
 
 
@@ -234,9 +244,9 @@ public:
 	bool Free(DATA *pData); // 그렇다면 외부에서 이 함수를 통해 반환하고, 나중에 이 주소값을 사용하려고 한다면? -> 주의
 
 
-	//////////////////////////////////
-	// 총 확보된 블록의 갯수 리턴
-	//////////////////////////////////
+							//////////////////////////////////
+							// 총 확보된 블록의 갯수 리턴
+							//////////////////////////////////
 	int GetBlockCount(void);
 
 
@@ -251,19 +261,18 @@ public:
 
 private:
 	// 생성시 할당량
-	int m_iBlockSize;
 	bool m_bUseConstruct;
+	bool m_Fixed;
 
-	int m_iAllocCount;
+	LONG64 m_iBlockSize;
+	LONG64 m_iAllocCount;
+	LONG64 m_iUnique;
 
-
-
-	st_BLOCK_NODE *pTop;
+	//st_BLOCK_NODE *pTop;
+	st_Top *pTop;
 	st_BLOCK_NODE *pTail;
 
 	CLinkedList<st_BLOCK_NODE *> List;
-
-	CRITICAL_SECTION m_CrticalSection;
 
 };
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -273,15 +282,19 @@ private:
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 template <class DATA>
 CMemoryPool<DATA>::CMemoryPool(int blockSize, bool bConst)
-	:m_iBlockSize(blockSize), m_bUseConstruct(bConst)
+	: m_iBlockSize(blockSize), m_bUseConstruct(bConst)
 {
-	InitializeCriticalSection(&m_CrticalSection);
+	//InitializeCriticalSection(&m_CrticalSection);
 
 	m_iAllocCount = 0;
-	pTop = nullptr;
 
 	st_BLOCK_NODE *pNewNode = nullptr;
 	st_BLOCK_NODE *pOldNode = nullptr;
+
+	if (blockSize > 1)
+		m_Fixed = true;
+	else
+		blockSize = 5;
 
 	pNewNode = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE));
 	memset(pNewNode, 0, sizeof(st_BLOCK_NODE));
@@ -289,10 +302,14 @@ CMemoryPool<DATA>::CMemoryPool(int blockSize, bool bConst)
 	List.push_back(pNewNode);
 	pOldNode = pNewNode;
 
-	for (int i = 1; i < blockSize; i++)
+
+	pTop = (st_Top *)_aligned_malloc(128, 16);
+	pTop->_TopNode = pNewNode;
+	pTop->UniqueCount = 0;
+
+	for (int i = 1; i <= blockSize; i++)
 	{
 		pNewNode = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE));
-		pNewNode->bAlloc = false;
 		pOldNode->pNextBlock = pNewNode;
 		pNewNode->pNextBlock = nullptr;
 		pNewNode->ValidCode = VALIDCODE;
@@ -308,7 +325,7 @@ CMemoryPool<DATA>::CMemoryPool(int blockSize, bool bConst)
 template <class DATA>
 CMemoryPool<DATA>::~CMemoryPool()
 {
-	DeleteCriticalSection(&m_CrticalSection);
+	//DeleteCriticalSection(&m_CrticalSection);
 
 	auto iter = List.begin();
 
@@ -319,50 +336,66 @@ CMemoryPool<DATA>::~CMemoryPool()
 		free(pNode);
 	}
 
-}
+	_aligned_free(pTop);
 
+}
+// 삽입은 ABA문제에 거의 문제가 안생긴다.
+// 
 template <class DATA>
 DATA* CMemoryPool<DATA>::Alloc(void)
 {
-	EnterCriticalSection(&m_CrticalSection);
+	//EnterCriticalSection(&m_CrticalSection);
 
-	if (pTop == nullptr)
-		pTop = *List.begin();  // 단 애는 딱 처음 Alloc했을때에만 작동하게끔 한다.
+	/////////////////////////////////////////////////////////////////////////////////////////////
+	//DATA *ret = &pTop->Data;
+	//pTop->bAlloc = true;
+	//pTop = pTop->pNextBlock;
+	// 이 구간은 스레드별 한번만 수행할수 있게 처리해야 된다.
+	st_Top OldTop;
+	st_BLOCK_NODE *pNewNode = nullptr;
+	DATA *ret = nullptr;
+	LONG64 Unique = InterlockedIncrement64(&m_iUnique);
 
-
-	/////////////////////////////////////////////////////////////////////
-	// 노드생성
-	// AllocCount와 블록카운트 값 비교
-	/////////////////////////////////////////////////////////////////////
-	if (m_iAllocCount >= m_iBlockSize - 5)
+	while (1)
 	{
-		// 노드를 새로 생성한다.
-		// 생성할 위치는?  pTail;
-		for (int i = 0; i < 5; i++)
+		OldTop._TopNode = pTop->_TopNode;
+		OldTop.UniqueCount = pTop->UniqueCount;
+
+		if (m_iAllocCount > m_iBlockSize)
 		{
-			st_BLOCK_NODE *pNewNode = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE));
-			pNewNode->ValidCode = VALIDCODE;
-			pNewNode->pNextBlock = nullptr;
+			if (m_Fixed)
+				continue;
 
-			pTail->pNextBlock = pNewNode;
-			pTail = pNewNode;
+			for (int i = 0; i < 5; i++)
+			{
+				st_BLOCK_NODE *pNode = (st_BLOCK_NODE *)malloc(sizeof(st_BLOCK_NODE));
+				pNode->ValidCode = VALIDCODE;
+				pNode->pNextBlock = nullptr;
 
-			m_iBlockSize++;
+				pTail->pNextBlock = pNode;
+				pTail = pNode;
+
+				//m_iBlockSize++;
+				InterlockedIncrement64(&m_iBlockSize);
+			}
 		}
+
+		pNewNode = OldTop._TopNode->pNextBlock;
+		
+		// 다른 스레드와 충돌했는가? -> 실패시 시도전으로 돌아간다.
+		// 충돌의 기준 = OldPop과 pPop의 값 변경이 생겼는가? -> 이외의 값이 변경되지 않게끔 해야된다.
+		// 현재 Alloc된게 다시 Alloc되고 있다.
+		if (InterlockedCompareExchange128((LONG64 *)pTop, (LONG64)Unique, (LONG64)pNewNode, (LONG64 *)&OldTop))
+		{
+			InterlockedIncrement64(&m_iAllocCount);
+			return &OldTop._TopNode->Data;
+			break;
+		}
+		else
+			OldTop = { 0 };
+		
+		/////////////////////////////////////////////////////////////////////////////////////////////
 	}
-
-	// pTop의 데이터포인터를 리턴할수 있게 한다.
-	DATA *ret = &pTop->Data;
-
-	pTop->bAlloc = true;
-	// pTop을 다음으로 넘긴다.
-	pTop = pTop->pNextBlock;
-
-	m_iAllocCount++;
-
-	LeaveCriticalSection(&m_CrticalSection);
-
-	return ret;
 }
 // DATA pData와 st_BLOCK_NODE pTop으로 처리해야된다.
 // 1. pData가 not null일때
@@ -380,29 +413,31 @@ bool CMemoryPool<DATA>::Free(DATA *pData)
 	if (pDel->ValidCode != VALIDCODE)
 		return false;
 
+	// 이 구간은 스레드별 한번만 수행할수 있게 처리해야 된다.
+	st_Top OldTop;
+	LONG64 Unique = InterlockedIncrement64(&m_iUnique);
 
-	EnterCriticalSection(&m_CrticalSection);
-
-	if (pTop == pDel->pNextBlock || pTop == pDel)
-		pTop = pDel;
-
-	else
+	while(1)
 	{
-		st_BLOCK_NODE *T = pTop->pNextBlock;
+		// 자료구조를 변경한다.
+		//Unique = InterlockedIncrement64(&pPop->UniqueCount);
+		OldTop._TopNode = pTop->_TopNode;
+		OldTop.UniqueCount = pTop->UniqueCount;
 
-
-		pDel->pNextBlock = T;
-		pTop->pNextBlock = pDel;
+		if (OldTop._TopNode != pDel->pNextBlock && OldTop._TopNode != pDel)
+			pDel->pNextBlock = OldTop._TopNode;
+		
+		// 다른 스레드와 충돌했는가? -> 실패시 시도전으로 돌아간다.
+		// 충돌의 기준 = OldPop과 pPop의 값 변경이 생겼는가? -> 이외의 값이 변경되지 않게끔 해야된다. => Lock Free 효과를 위해서
+		// 위의 연산들은 Wait-Free하지않음.
+		if (InterlockedCompareExchange128((LONG64 *)pTop, (LONG64)Unique, (LONG64)pDel, (LONG64 *)&OldTop))
+		{
+			InterlockedDecrement64(&m_iAllocCount);
+			return true;
+		}
+		else
+			OldTop = { 0 };
 	}
-
-	pDel->bAlloc = false;
-
-
-	m_iAllocCount--;
-	LeaveCriticalSection(&m_CrticalSection);
-
-
-	return true;
 }
 
 template <class DATA>
